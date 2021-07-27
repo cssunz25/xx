@@ -1,0 +1,460 @@
+#!/bin/sh
+
+
+#
+# Copyright (C) 2017  Hiveon Holding LTD
+# Distributed under Business Source License 1.1
+# License information can be found in the LICENSE.txt file or at https://github.com/minershive/hiveos-asic/blob/master/LICENSE.txt
+#
+# Linted by shellcheck 0.7.0
+#
+
+
+# shellcheck disable=SC2039
+# bc there's no classic POSIX sh but the ash/dash variant
+readonly script_mission='Client for ASICs: Boot & Deploy'
+readonly script_version='1.1.4'
+readonly script_basename="${0##*/}"
+
+
+# functions
+
+print_script_version () {
+	echo "${script_mission}, version ${script_version}"
+	echo
+}
+
+print_script_usage () {
+	echo "Usage: ${script_basename} [-f|--force] [-d|--force-deploy]"
+	echo
+	echo '  -d, --force-deploy        force to run a deployment procedure'
+	echo '  -f, --force-download      force to download a package from the download server'
+	echo
+}
+
+echo_action ()	{ echo "${script_basename}> ${*}...";	}
+echo_info ()	{ echo "${script_basename}: ${*}"	;	}
+echo_warning ()	{ echo "${script_basename}! ${*}"	;	}
+die ()			{ echo_warning "${*}"; exit 1		;	} 2>&1
+
+get_random_number_between () {
+	#
+	# Usage: get_random_number_between 'min_value' 'max_value'
+	#
+
+	# args
+
+	local min_value="$1"
+	local max_value="$2"
+
+	# code
+
+	awk -v min="$min_value" -v max="$max_value" 'BEGIN{ srand(); print int( min+rand() * (max-min+1) ) }'
+}
+
+parse_arguments () {
+	#
+	# Usage: parse_arguments "$@"
+	#
+
+	# vars
+
+	local this_ARG
+
+	# code
+
+	for this_ARG in "$@"; do
+		case "$this_ARG" in
+			'-f'|'--force-download')
+				force_download_FLAG=1
+				;;
+			'-d'|'--force-deploy')
+				force_deploy_FLAG=1
+				;;
+			'start'|'stop'|'restart')
+				executed_by_rc_FLAG=1
+				;;
+			'')
+				: ok good to go
+				;;
+			*)
+				print_script_version
+				echo "Invalid option '$this_ARG'"
+				echo
+				print_script_usage
+				exit 1
+				;;
+		esac
+	done
+
+	if [ -f "${NVRAM_path}/${dev_build_file}" ]; then # how'd you like a secret stuff
+		# unconditional download & deploy with latest dev build
+		remote_package_filename="$dev_build_package_filename"
+		dev_build_FLAG=1
+		force_download_FLAG=1
+		force_deploy_FLAG=1
+		echo_info 'good to know that the reptilians controlling the world, eh?'
+	fi
+}
+
+download_from_URL_to_file () {
+	#
+	# Usage: download_from_URL_to_file 'file_url' 'output_file'
+	#
+
+	# args
+
+	local file_url="$1"
+	local output_file="$2"
+
+	# vars
+
+	local curl_output=''
+
+	# code
+
+	echo_action "Downloading package from $file_url to $output_file"
+	if ! curl_output="$( curl --insecure --location --fail --silent --show-error --output "$output_file" "$file_url" 2>&1 )"; then
+		echo_warning "$curl_output"
+		echo_warning "Downloading FAILED"
+		return 1
+	else
+		echo_info "Downloaded OK"
+		return 0
+	fi
+}
+
+check_gz_integrity () {
+	#
+	# Usage: check_gz_integrity 'gz_to_check'
+	#
+
+	# args
+
+	local gz_to_check="$1"
+
+	# code
+
+	echo_action "Checking $gz_to_check integrity"
+
+	if [ ! -s "$gz_to_check" ]; then
+		echo_warning "$gz_to_check not found or empty"
+		return 1
+	elif ! gunzip -tf "$gz_to_check" >/dev/null 2>&1; then
+		echo_warning "Checking integrity FAILED with error $?"
+		return 1
+	else
+		echo_info "Checked OK"
+		return 0
+	fi
+}
+
+fetch_package_at_any_cost () {
+	#
+	# Usage: fetch_package_at_any_cost 'URL' 'output_file'
+	#
+	# overwrites output file only on success
+	#
+
+	# args
+
+	local URL="$1"
+	local output_file="$2"
+
+	# consts
+
+	local retries_limit=15 # max.time from 10m to 60m
+	local temporary_file="${output_file}.S69download"
+
+	# vars
+
+	local retries_counter=0
+	local snooze_counter=0
+	local base_snooze_time=0
+	local snooze_time=0
+
+	# code
+
+	base_snooze_time="$( get_random_number_between 5 30 )"
+	echo_action "Wait for random ${base_snooze_time}s (make it easier for a bulk update)"
+	sleep "$base_snooze_time"
+	base_snooze_time="$( get_random_number_between 5 30 )" # srand() again -- a better randomness
+
+	until download_from_URL_to_file "$URL" "$temporary_file" && check_gz_integrity "$temporary_file"; do
+		if [ "$retries_counter" -ge "$retries_limit" ]; then
+			# return false
+			echo_warning "No success, $retries_counter attempts were made in ${snooze_counter}s"
+			[ -f "$temporary_file" ] && rm "$temporary_file"
+			return 1
+		fi
+		# shellcheck disable=SC2039
+		: $(( retries_counter++ ))
+		snooze_time=$(( base_snooze_time * retries_counter )) # every attempt will be later and later
+		: $(( snooze_counter += snooze_time ))
+		echo_warning "Take a break. Attempt #${retries_counter} in ${snooze_time}s..."
+		sleep "$snooze_time"
+	done
+
+	echo_action "Copying $temporary_file to $output_file"
+	if cp "$temporary_file" "$output_file"; then
+		echo_info "Copied OK"
+	else
+		echo_warning "Copying FAILED"
+	fi
+	rm "$temporary_file" || echo_warning 'Removing temporary file FAILED'
+	sync
+
+	return 0
+}
+
+set_default_download_server_URL () {
+	#
+	# Usage: set_default_download_server_URL
+	#
+	# sets download_server_URL global var
+	#
+
+	# consts
+
+	local      whitelabel_HIVE_HOST_URL_file_in_FW='/etc/hive-url'				# prio 4
+	local   whitelabel_HIVE_HOST_URL_file_in_NVRAM='/config/hive-url'			# prio 3
+	#local                      HIVE_HOST_URL_file='/config/HIVE_HOST_URL'		# prio 2 # already declared as a gobal readonly, !!! should refactor later
+	local whitelabel_HIVE_DOWNLOADS_URL_file_in_FW='/etc/hive-downloads-url'	# prio 1
+
+	local whitelabel_download_server_URL_files_collection="
+		$whitelabel_HIVE_HOST_URL_file_in_FW
+		$whitelabel_HIVE_HOST_URL_file_in_NVRAM
+		$HIVE_HOST_URL_file
+		$whitelabel_HIVE_DOWNLOADS_URL_file_in_FW
+	" # the order is important: sorted by prio, from low to high (??? cannot remember why isn't backwards)
+
+	# vars
+
+	local whitelabel_download_server_URL_file
+
+	# code
+
+	[ "$dev_build_FLAG" -eq 1 ] && return
+
+	# 1. try whitelabel file
+	for whitelabel_download_server_URL_file in $whitelabel_download_server_URL_files_collection; do
+		if [ -s "$whitelabel_download_server_URL_file" ]; then
+			# replace 'api.' with 'download.'
+			# !!! potential problem: API server with a pure IP address + firewalled *.hiveos.farm
+			download_server_URL="$( tr -d ';|"' < "$whitelabel_download_server_URL_file" | sed 's|api\.|download\.|' )" #'# syntax highlighting fix
+			echo_info "Whitelabel server URL found in $whitelabel_download_server_URL_file: $download_server_URL"
+		fi
+	done
+
+	# url refining
+	case "$download_server_URL" in
+		*'download'*)
+			: ok good to go
+			;;
+		'')
+			echo_warning "Empty server URL, using default $default_download_server_URL"
+			download_server_URL="$default_download_server_URL"
+			;;
+		*)
+			echo_warning "Invalid server URL '$download_server_URL', using default $default_download_server_URL"
+			download_server_URL="$default_download_server_URL"
+			;;
+	esac
+}
+
+set_NVRAM_path () {
+	#
+	# Usage: set_NVRAM_path
+	#
+
+	# consts
+
+	local package_at_default_path="${NVRAM_path_default}/${persistent_package_filename}"
+	local package_at_quirk_path="${NVRAM_path_quirk}/${persistent_package_filename}"
+
+	# code
+
+	# shellcheck disable=SC2039
+	if [ -s "$package_at_default_path" ] && [ -s "$package_at_quirk_path" ] && [ "$package_at_quirk_path" -nt "$package_at_default_path" ]; then
+		# quirk is newer, use quirk
+		NVRAM_path="$NVRAM_path_quirk" # duct tape for dear Vitya
+	elif [ -d "$NVRAM_path_quirk" ]; then
+		NVRAM_path="$NVRAM_path_quirk" # duct tape for dear Vitya
+	fi
+}
+
+deploy_client () {
+	#
+	# Usage: deploy_client &
+	#
+
+	# vars
+
+	local full_package_URL='' tar_output='' this_URL
+	local persistent_package_filename_w_path="${NVRAM_path}/${persistent_package_filename}"
+
+	# flags
+
+	local is_package_inplace_ok_FLAG=0 # the package already exists and its integrity is ok, 1/[0]
+	local is_package_fetched_ok_FLAG=0 # the package was downloaded ok, 1/[0]
+
+	# code
+
+	echo_action 'The Client deployment launched in the background'
+
+	if [ -f "$persistent_package_filename_w_path" ]; then
+		echo_info "Package $persistent_package_filename_w_path found"
+		if check_gz_integrity "$persistent_package_filename_w_path"; then
+			is_package_inplace_ok_FLAG=1
+		else
+			rm -rf "${persistent_package_filename_w_path:-SAFE}" # remove the broken package, to be sure
+			is_package_inplace_ok_FLAG=0
+		fi
+	else
+		echo_warning "Package $persistent_package_filename_w_path not found"
+		rm -rf "${persistent_package_filename_w_path:-SAFE}" # remove the broken package, to be sure
+		is_package_inplace_ok_FLAG=0
+	fi
+
+	if [ "$is_package_inplace_ok_FLAG" -eq 0 ] || [ "$force_download_FLAG" -eq 1 ]; then
+		set_default_download_server_URL
+		if [ "$download_server_URL" != "$default_download_server_URL" ]; then
+			# if server isn't default one -- add fall-back URL to the collection
+			download_server_URL="$download_server_URL $default_download_server_URL"
+		fi
+		for this_URL in $download_server_URL; do
+			full_package_URL="${this_URL}${remote_package_filename}"
+			#
+			# TODO do check the server availability beforehand and then proceed further or skip to the next one
+			#
+			if fetch_package_at_any_cost "$full_package_URL" "$persistent_package_filename_w_path"; then
+				is_package_fetched_ok_FLAG=1
+			else
+				echo_warning "Downloading $persistent_package_filename_w_path from $this_URL FAILED"
+			fi
+		done
+	fi
+
+	# assert: the package is ready for processing
+	{ [ "$is_package_inplace_ok_FLAG" -eq 1 ] || [ "$is_package_fetched_ok_FLAG" -eq 1 ]; } || die 'Fatal download error, exiting'
+
+	if [ ! -d /config/hive ]; then
+		mkdir -p /config/hive/hive-config
+	fi
+
+	echo_action "Extracting $persistent_package_filename_w_path"
+
+	cd "$NVRAM_path" || die "Changing directory to $NVRAM_path FAILED, exiting"
+	tar_output="$( tar -xzv -f "$persistent_package_filename_w_path" 2>&1 )" || die "${tar_output}\n\nExtracting $persistent_package_filename_w_path FAILED, exiting"
+
+	[ -L /hive ] && rm /hive
+	rm -rf hiveos-asic-*/hive/sbin/teleconsole # remove the legacy before copying
+
+	echo_action 'Copying extracted files to /hive and /home'
+	cp -rf hiveos-asic-*/hive / || die 'Copying files to /hive FAILED, exiting'
+	cp -rf hiveos-asic-*/home / || die 'Copying files to /home FAILED, exiting'
+
+	echo_action 'Copying finished, removing temporary files'
+	rm -rf hiveos-asic* || echo_warning 'Removing temporary files FAILED'
+	[ -f "${NVRAM_path}/${dev_build_file}" ] && rm -f "${NVRAM_path}/${dev_build_file}"
+
+	sleep 2
+
+	[ -d /hive-config ] && [ ! -L /hive-config ] && mv -f /hive-config /config/hive/
+	[ ! -L /hive-config ] && [ ! -e /hive-config ] && ln -s /config/hive/hive-config/ /hive-config
+
+	# took care of it a few lines up
+	#cp -rf /hive/share/S9/S69hive /etc/rcS.d/
+	#cp -rf /hive/share/S9/.profile /home/root/
+	#cp -rf /hive/share/S9/.screenrc /home/root/
+
+	boot_client &
+}
+
+boot_client () {
+	#
+	# Usage: boot_client &
+	#
+
+	echo_action 'The Client boot sequence launched in the background'
+
+	# $FARM_HASH can be defined externally
+	if [ -s "$FARM_HASH_file" ]; then
+		FARM_HASH=$( cat "$FARM_HASH_file" )
+		echo_info "External FARM_HASH found in $FARM_HASH_file: $FARM_HASH"
+		/hive/sbin/bash -c "/hive/bin/firstrun $FARM_HASH"
+		rm "$FARM_HASH_file"
+	fi
+
+	/hive/bin/hive > /tmp/client-boot.log 2>&1
+	echo_info 'The Client boot starting done'
+}
+
+
+# global consts
+
+readonly NVRAM_path_default='/nvdata'
+readonly NVRAM_path_quirk='/opt'
+readonly persistent_package_filename='latest.tar.gz'
+
+readonly dev_build_file='dev-build'
+
+readonly FARM_HASH_file='/config/FARM_HASH'
+readonly HIVE_HOST_URL_file='/config/HIVE_HOST_URL'
+
+readonly default_download_server_URL='http://download.hiveos.farm'
+
+readonly stable_package_filename="/asic/client/${persistent_package_filename}"
+readonly dev_build_package_filename="/_asic/client/${persistent_package_filename}"
+
+readonly own_log="/tmp/${script_basename}.log"
+
+
+# global vars
+
+NVRAM_path="$NVRAM_path_default"
+download_server_URL="$default_download_server_URL"
+remote_package_filename="$stable_package_filename"
+
+
+# global flags
+
+dev_build_FLAG=0
+force_download_FLAG=0
+force_deploy_FLAG=0
+executed_by_rc_FLAG=0
+
+
+# global exports
+
+case "$PATH" in
+	*'/hive/bin:/hive/sbin'*)	: ok good to go								;;
+	'')							export PATH='/hive/bin:/hive/sbin'			;;
+	*)							export PATH="$PATH:/hive/bin:/hive/sbin"	;;
+esac
+export LD_LIBRARY_PATH=/hive/lib
+
+
+# code
+
+[ -t 1 ] || exec >> "$own_log" 2>&1
+trap 'echo_warning "SIGHUP received, ignoring..."' HUP # 'SIGHUP' isn't a POSIX name
+
+set_NVRAM_path
+parse_arguments "$@"
+
+if [ "$executed_by_rc_FLAG" -eq 1 ]; then
+	exec >> "$own_log" 2>&1
+	pretty_formatted_cmdline="$( printf '%s' "$0"; printf " '%s'" "$@" )"
+	echo_info "Started by rc (cmdline: $pretty_formatted_cmdline), output logged to $own_log"
+fi
+
+echo_action "$script_mission $script_version started"
+
+if [ -e /hive ] && [ "$force_deploy_FLAG" -eq 0 ]; then
+	boot_client &
+else
+	[ "$force_download_FLAG" -eq 1 ] && echo_warning 'Force download mode ON'
+	[ "$force_deploy_FLAG" -eq 1 ] && echo_warning 'Force deployment mode ON'
+	deploy_client &
+fi

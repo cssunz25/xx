@@ -1,0 +1,89 @@
+#!/bin/sh
+
+
+#
+# Copyright (C) 2016-2020  Hiveon
+# Distributed under GNU GENERAL PUBLIC LICENSE 2.0
+# License information can be found in the LICENSE file or at https://github.com/minershive/hiveos-asic/blob/master/LICENSE.txt
+#
+# Linted by shellcheck 0.3.7
+#
+
+readonly own_log="/tmp/${script_basename}.log"
+
+[ -t 1 ] || exec >> "$own_log" 2>&1
+trap -- 'echo_info "SIGHUP received, ignoring..."' SIGHUP
+
+sleep 10
+rm -rf /tmp/*.log
+
+if [ ! -d /config/hive/hive-config ]; then
+	mkdir -p /config/hive/hive-config
+fi
+
+if [ ! -e /hive ]; then
+	cd /tmp
+
+	if [ -s /etc/hive-downloads-url ]; then
+		hive_domain_special="$( cat /etc/hive-downloads-url )"
+	elif [ -s /config/HIVE_HOST_URL ]; then
+		hive_domain_special="$( sed 's|//api\.|//download.|' < /config/HIVE_HOST_URL )"
+	fi
+
+	hive_domain_default='http://download.hiveos.farm'
+	hive_domain_backup='http://download2.hiveos.farm'
+
+	for this_domain in $hive_domain_special $hive_domain_default $hive_domain_backup; do
+		echo "> Downloading latest.tar.gz from $this_domain..."
+		URL="${this_domain}/asic/client/latest.tar.gz"
+		if curl --retry 3 --location --insecure "$URL" --output latest.tar.gz; then
+			is_downloaded=1
+			break
+		else
+			is_downloaded=0
+			echo 'Error downloading latest.tar.gz'
+		fi
+	done
+
+	[ "$is_downloaded" -eq 0 ] && exit 1
+
+#	if [ ! -d /config/hive/hive-config ]; then
+#		mkdir -p /config/hive/hive-config
+#	fi
+	echo '> Extracting latest.tar.gz...'
+	tar -xzv -f latest.tar.gz || { echo 'Error extracting'; exit 1; }
+	[ -L /hive ] && rm /hive
+	rm -rf hiveos-asic-*/hive/sbin/teleconsole
+	echo '> Copying hive to /...'
+	cp -rf hiveos-asic-*/hive / || { echo 'Error copying'; exit 1; }
+
+	rm latest.tar.gz
+	rm -rf hiveos-asic*
+
+	sleep 2
+
+	case "$PATH" in
+		*'/hive/bin:/hive/sbin'*)	: ok good to go								;;
+		*)							export PATH="$PATH:/hive/bin:/hive/sbin"	;;
+	esac
+	export LD_LIBRARY_PATH=/hive/lib
+	[ -d /hive-config ] && [ ! -L /hive-config ] && mv -f /hive-config /config/hive/
+	ln -s /config/hive/hive-config/ /hive-config
+	#cp -rf /hive/share/S9/S69hive /etc/rcS.d/
+	cp -rf /hive/share/S9/.profile /home/root/
+
+	#/hive/bin/hive
+
+	#sleep 2
+
+	#$FARM_HASH can be defined externally
+	if [ -s /config/FARM_HASH ]; then
+		FARM_HASH="$( cat /config/FARM_HASH )"
+		/hive/bin/firstrun "$FARM_HASH"
+		rm /config/FARM_HASH
+	fi
+else
+	export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}${LD_LIBRARY_PATH:+:}/hive/lib"
+fi
+
+/hive/bin/hive > /tmp/client-boot.log 2>&1

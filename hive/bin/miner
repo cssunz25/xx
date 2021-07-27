@@ -1,0 +1,582 @@
+#!/hive/sbin/bash
+
+
+#
+# Copyright (C) 2017  Hiveon Holding LTD
+# Distributed under Business Source License 1.1
+# License information can be found in the LICENSE.txt file or at https://github.com/minershive/hiveos-asic/blob/master/LICENSE.txt
+#
+# Linted by shellcheck 0.7.0
+#
+
+
+# shellcheck disable=SC2034,SC1091
+{
+	readonly script_mission='Client for ASICs: Miner controller'
+	readonly script_version='1.3.9'
+	readonly script_basename="${0##*/}"
+	#
+	source /hive/bin/hive-functions.sh || { echo 'ERROR: /hive/bin/hive-functions.sh not found'; exit 1; }
+}
+
+
+# functions
+
+function echo_x {
+	# args
+	local -r event_type="${1-}"
+	local -r event_message="${2-}"
+	local -r event_statement="${3-}"
+
+	# vars
+	local event_prefix statement_color event_suffix name_color="${LGRAY-}"
+
+	# code
+	case "$event_type" in
+		'ok'		)	event_prefix=':'		;	statement_color="${BGREEN-}"	;	event_suffix=''								;;
+		'action'	)	event_prefix='>'		;	statement_color="${WHITE-}"		;	event_suffix='...'							;;
+		'info'		)	event_prefix=':'		;	statement_color=''				;	event_suffix=''								;;
+		'warning'	)	event_prefix=':'		;	statement_color="${BYELLOW-}"	;	event_suffix=''								;;
+		'debug'		)	event_prefix=' [DEBUG]:';	statement_color="${BPURPLE-}"	;	event_suffix=''	;	name_color="${DGRAY-}"	;;
+		'error'		)	event_prefix=':'		;	statement_color="${BRED-}"		;	event_suffix=''								;;
+	esac
+	if [[ -z "$event_statement" ]]; then
+		echo -e "${name_color}${script_basename}${event_prefix} ${statement_color}${event_message}${event_suffix}${NOCOLOR-}"
+	else
+		echo -e "${name_color}${script_basename}${event_prefix} ${NOCOLOR-}${event_message}${event_suffix} ${statement_color}${event_statement}${NOCOLOR-}"
+	fi
+}
+
+function script_usage {
+	echo -e "Usage: ${CYAN-}$script_basename [start|stop|restart|config-gen]${NOCOLOR-}"
+	echo -e "       ${CYAN-}$script_basename config [raw]${NOCOLOR-}                               display a miner config"
+	echo -e "       ${CYAN-}$script_basename log [kernel|status|tuning|watchdog|all]${NOCOLOR-}    display a corresponding log"
+	echo -e "       ${CYAN-}$script_basename tuning${NOCOLOR-}                                     deprecated, please do not use"
+	echo
+	echo -e "If you run ${CYAN-}$script_basename${NOCOLOR-} without parameters the miner screen will be tried to resume"
+}
+
+# config functions
+
+function generate_config {
+	if (( is_no_Flight_Sheet )); then
+		echo_x warning "Flight Sheet not found or invalid (MINER='$MINER'), cannot generate config"
+		return 1
+	else
+		/hive/bin/asicminer-config
+	fi
+}
+
+function print_config {
+	# shows miner config
+	if [[ -n "$ASIC_MINER_CONFIG_FILE" ]]; then
+		tail_any_log "$ASIC_MINER_CONFIG_FILE"
+	else
+		echo_x error "No config path defined for model '$ASIC_MODEL'"
+	fi
+}
+
+function print_config_raw {
+	# shows miner config without a decoration
+	if [[ -n "$ASIC_MINER_CONFIG_FILE" ]]; then
+		cat "$ASIC_MINER_CONFIG_FILE"
+	else
+		echo_x error "No config path defined for model '$ASIC_MODEL'"
+	fi
+}
+
+# start/stop/restart functions
+
+function miner_start {
+	# args
+	local arg="$1"
+
+	# consts
+	local -r s17_stop_mining_semaphore_FILE='/config/stop-mining'
+
+	# vars
+	local -i is_started_by_user=0
+	local chain_to_repair_0based='' chain_to_repair_1based=''
+
+	# code
+	[[ "$arg" == 'by_user' ]] && is_started_by_user=1
+
+	# process the Series 17 Safe Mode override
+	if (( is_started_by_user )) && [[ -s "$s17_stop_mining_semaphore_FILE" ]]; then
+		chain_to_repair_1based="$( < "$s17_stop_mining_semaphore_FILE" )"
+		# shellcheck disable=SC2154
+		# bc positive_integer_RE defined in the library
+		if [[ "$chain_to_repair_1based" =~ $positive_integer_RE ]]; then
+			chain_to_repair_0based="#$(( chain_to_repair_1based - 1 )) " # chain numbers in the file are 1-based
+		fi
+
+		if rm -f "$s17_stop_mining_semaphore_FILE"; then
+			echo_x ok  "Safe mode override: mining resumed. Please repair chain ${chain_to_repair_0based}ASAP"
+			message ok "Safe mode override: mining resumed. Please repair chain ${chain_to_repair_0based}ASAP" --silent
+		fi
+	fi
+
+	echo_x action "Starting ${CYAN-}$ASIC_MINER_NAME${NOCOLOR-}"
+	if [[ -f /config/norespawn ]]; then # instead resume_miner.cgi
+		rm -f /config/norespawn
+	fi
+	if [[ -f /sbin/watchdog_restart.pl ]]; then
+		# S9/T9 Hiveon
+		generate_config
+		[[ -f /tmp/norespawn ]] && rm -f /tmp/norespawn
+	elif [[ -f /www/pages/cgi-bin/restart_miner.cgi ]]; then
+		# S17/T17 Hiveon
+		generate_config
+		sh /www/pages/cgi-bin/restart_miner.cgi
+#	elif [[ -f /www/pages/cgi-bin/resume_miner.cgi ]]; then
+#		# S17/T17 Hiveon
+#		generate_config
+#		sh /www/pages/cgi-bin/resume_miner.cgi
+	elif [[ "$ASIC_MODEL" =~ 'Toddminer C1' ]]; then
+		generate_config
+		/hive/bin/todd_api mstart
+#		/home/sm/miner/build/miner.sh &
+	else
+		for i in {1..15}; do
+			# shellcheck disable=SC2009
+			# bc we don't have pgrep in most cases
+			test_miner="$( ps | grep -e 'bmminer' -e 'cgminer' -e 'single-board-test' | grep -v -e 'grep' -e 'systemctl' )"
+			if [[ -z "$test_miner" ]] ; then
+				generate_config
+				screen -d > /dev/null
+				if [[ $ASIC_MODEL == *'.g19'* || $ASIC_MODEL == 't3.soc' ]]; then
+					systemctl start cgminer.service
+				elif [[ $ASIC_MODEL == 't3h+.soc' || $ASIC_MODEL == 't3+.soc' || $ASIC_MODEL == 't2th+.soc' || $ASIC_MODEL == 't2thf+.soc' || $ASIC_MODEL == 't2thl+.soc' || $ASIC_MODEL == 't2th.soc' || $ASIC_MODEL == 't2tz.soc' || $ASIC_MODEL == 't2thm.soc' || $ASIC_MODEL == 't2thf.soc' || $ASIC_MODEL == 't2t+.soc' || $ASIC_MODEL == 't2ts.soc' || $ASIC_MODEL == 't2ti.soc' || $ASIC_MODEL == 't2t.soc' || $ASIC_MODEL == 't1.g19' ]]; then
+					systemctl start cgminer.service
+					#timeout -t 600 /hive/bin/inno_api updatePools
+					timeout -t 600 /hive/bin/inno_api updateFanspeed
+					timeout -t 600 /hive/bin/inno_api setAutoTune
+				elif [[ $ASIC_MODEL =~ 'Zig Z1' ]]; then
+					break
+				elif [[ $ASIC_MODEL == 'T4.G19' ]]; then
+					python3.4 /home/inno_tools/start_miner.py &
+				else
+					nohup "/etc/init.d/$ASIC_MINER_NAME.sh" start > /dev/null 2>&1 &
+				fi
+				break
+			fi
+			snore 1
+		done
+		if pgrep_quiet /sbin/monitorcg && ! grep -q 'norespawn' /sbin/monitorcg; then
+			echo_x action "Resuming ${CYAN-}monitorcg${NOCOLOR-} watchdog"
+			killall -CONT monitorcg
+		fi
+	fi
+#	echo
+}
+
+function miner_stop {
+	# args
+	local arg="$1"
+
+	# vars
+	local -i is_stopped_by_user=0
+
+	# code
+	[[ "$arg" == 'by_user' ]] && is_stopped_by_user=1
+
+	echo_x action "Stopping ${CYAN-}$ASIC_MINER_NAME${NOCOLOR-}"
+	if [[ -f /sbin/watchdog_restart.pl ]]; then
+		# S9/T9 Hiveon
+		echo 'ok' > /tmp/norespawn
+		if lighttpd_owner="$( get_process_owner 'lighttpd' )" && [[ "$lighttpd_owner" != 'root' ]]; then
+			if ! chown "$lighttpd_owner:$lighttpd_owner" /tmp/norespawn > /dev/null 2>&1; then
+				echo_x error "Couldn't chown /tmp/norespawn as '$lighttpd_owner'"
+			fi
+		fi
+	elif [[ -f /www/pages/cgi-bin/stop_miner.cgi ]]; then
+		# S17/T17 Hiveon
+		sh /www/pages/cgi-bin/stop_miner.cgi
+	else
+		if [[ $ASIC_MODEL == *'.g19'* || $ASIC_MODEL == 't3.soc' || $ASIC_MODEL == 't3h+.soc' || $ASIC_MODEL == 't3+.soc' || $ASIC_MODEL == 't2th+.soc' || $ASIC_MODEL == 't2thf+.soc' || $ASIC_MODEL == 't2thl+.soc' || $ASIC_MODEL == 't2th.soc' || $ASIC_MODEL == 't2tz.soc' || $ASIC_MODEL == 't2thm.soc' || $ASIC_MODEL == 't2thf.soc' || $ASIC_MODEL == 't2t+.soc' || $ASIC_MODEL == 't2ts.soc' || $ASIC_MODEL == 't2ti.soc' || $ASIC_MODEL == 't2t.soc' || $ASIC_MODEL == 't1.g19' ]]; then
+			systemctl stop cgminer.service
+		elif [[ $ASIC_MODEL =~ 'Zig Z1' ]]; then
+			pidof miner | xargs kill -9
+		elif [[ $ASIC_MODEL == 'T4.G19' ]]; then
+			killall innominer_T4
+		elif [[ $ASIC_MODEL =~ 'Toddminer C1' ]]; then
+			/hive/bin/todd_api mstop
+		else
+			if (( is_stopped_by_user )) && pgrep_quiet /sbin/monitorcg && ! grep -q 'norespawn' /sbin/monitorcg; then
+				#                                                                    ^^^^^^^^^ norespawn mod, Hiveon only
+				# suspend monitorcg watchdog on the stock Antminers (and L3 Hiveon too)
+				echo_x action "Suspending ${CYAN-}monitorcg${NOCOLOR-} watchdog"
+				killall -STOP monitorcg
+			fi
+			"/etc/init.d/$ASIC_MINER_NAME.sh" stop
+		fi
+	fi
+	if (( is_stopped_by_user )); then
+		message warning "The mining permanently stopped. To start mining again you have to send a command 'miner start'" --silent
+	fi
+}
+
+function miner_restart {
+	echo_x action "Restarting ${CYAN-}$ASIC_MINER_NAME${NOCOLOR-}"
+	if [[ -f /config/norespawn ]]; then # instead resume_miner.cgi
+		rm -f /config/norespawn
+	fi
+	if [[ -f /sbin/watchdog_restart.pl ]]; then
+		# S9/T9 Hiveon
+		generate_config
+		[[ -f /tmp/norespawn ]] && rm -f /tmp/norespawn
+		echo 'ok' > /config/restart
+#	elif [[ -f /www/pages/cgi-bin/resume_miner.cgi ]]; then # still killall
+#		# S17/T17 Hiveon
+#		generate_config
+#		sh /www/pages/cgi-bin/resume_miner.cgi
+	elif [[ -f /www/pages/cgi-bin/restart_miner.cgi ]]; then
+		generate_config
+		sh /www/pages/cgi-bin/restart_miner.cgi
+	elif [[ "$ASIC_MODEL" =~ 'Toddminer C1' ]]; then
+		miner_start
+	else
+		miner_stop
+		miner_start
+	fi
+}
+
+
+# log processing functions
+
+function print_default_log {
+	# code
+	if (( IS_ASIC_CUSTOM_FW )); then
+		sh /www/pages/cgi-bin/get_kernel_log.cgi # | tail -n "$lines_to_tail"
+	else
+		if [[ "$ASIC_MODEL" == *'.g19'* ]]; then
+			if [[ "$ASIC_MANUFACTURER" == 'DragonMint' ]]; then
+				journalctl -u cgminer -n "$lines_to_tail"
+			else
+				journalctl -n "$lines_to_tail"
+			fi
+		elif [[ "$ASIC_MODEL" =~ 'Toddminer C1' ]]; then
+			/hive/bin/todd_api mlog
+		else
+			if [[ ! -f "$ASIC_LOG_FILE" ]]; then
+				echo_x warning "Log $ASIC_LOG_FILE does not exist yet"
+			elif [[ "$( get_file_size_in_bytes "$ASIC_LOG_FILE" )" -le 1 ]]; then #can be 1, empty line
+				echo_x warning "Log $ASIC_LOG_FILE is empty"
+			else
+				tail_any_log "$ASIC_LOG_FILE"
+			fi
+		fi
+	fi
+}
+
+function tail_any_log {
+	#
+	# tail_any_log [-d] [-r PATTERN] [-s] [-t LINES] ['input_file']
+	#
+	# -d decorations (header & footer) off
+	# -r extended regex pattern
+	# -s sort
+	# -t tail lines
+
+	# defaults
+
+	local -r -i	is_decoration_DEFAULT=1
+	local -r -i	is_from_file_DEFAULT=1
+	local -r -i	is_regex_DEFAULT=0
+	local -r -i	is_sort_DEFAULT=0
+	local -r -i	is_tail_DEFAULT=0
+
+	# options
+
+	local -i	is_decoration="$is_decoration_DEFAULT"
+	local -i	is_from_file="$is_from_file_DEFAULT"
+	local -i	is_regex="$is_regex_DEFAULT"
+	local -i	is_sort="$is_sort_DEFAULT"
+	local -i	is_tail="$is_tail_DEFAULT"
+	local -i	tail_lines=
+	local		regex_pattern=
+
+	# vars
+
+	local -i now last_modified_time_in_seconds file_size
+	local option input_file last_modified_time_human_readable last_modified_time_dhms
+
+	# arguments parsing
+
+	while getopts ':dr:st:' option; do
+		case "$option" in
+			d)	is_decoration=0
+				;;
+			r)	is_regex=1
+				regex_pattern="$OPTARG"
+				;;
+			s)	is_sort=1
+				;;
+			t)	is_tail=1
+				tail_lines="$OPTARG"
+				;;
+			*)	echo_x warning "invalid argument '$option'"
+				;;
+		esac
+	done
+	shift $(( OPTIND - 1 ))
+	local -r input_file="${1-}"
+
+	# code
+
+	if [[ -z "$input_file" || "$input_file" == '-' ]]; then
+		is_from_file=0
+	fi
+
+	if (( is_from_file )); then
+		if [[ -r "$input_file" ]]; then
+			file_size="$( get_file_size_in_bytes "$input_file" )"
+			if (( is_decoration )); then
+				last_modified_time_in_seconds="$( get_file_last_modified_time_in_seconds "$input_file" )"
+				now="$( get_current_system_time_in_seconds )"
+				(( timespan_between_now_and_last_modified = now - last_modified_time_in_seconds ))
+				last_modified_time_dhms="$( format_date_in_seconds "$timespan_between_now_and_last_modified" 'dhms' )"
+				last_modified_time_human_readable="$( format_date_in_seconds "$last_modified_time_in_seconds" )"
+
+				header="File ${WHITE-}$input_file${NOCOLOR-}"
+				(( is_tail )) && header+=", last ${WHITE-}${tail_lines}${NOCOLOR-} lines"
+				(( is_regex )) && header+=", filtered by '${WHITE-}$regex_pattern${NOCOLOR-}'"
+
+				echo -e "${header}:"
+				echo
+			fi
+
+			if (( file_size <= 1 )); then
+				echo_x warning "$input_file is empty"
+			fi
+		else
+			echo_x warning "$input_file not found or not readable"
+			# shellcheck disable=SC2154
+			# bc positive_integer_RE defined in the library
+			return $(( exitcode_ERROR_NOT_FOUND ))
+		fi
+	fi
+
+	# tremble before awesome 4-stage conditional pipe!
+	iif_pipe "$is_from_file" cat "$input_file" |
+		iif_pipe "$is_regex" grep -E -e "$regex_pattern" |
+			iif_pipe "$is_sort" sort -us |
+				iif_pipe "$is_tail" tail -n "$tail_lines"
+
+	if (( is_from_file )); then
+		if (( is_decoration )); then
+			echo
+			echo -e "${WHITE-}$last_modified_time_human_readable${NOCOLOR-} file was last modified ${WHITE-}$last_modified_time_dhms${NOCOLOR-} ago"
+		fi
+	fi
+}
+
+function print_kernel_log {
+	#
+	# Usage: print_kernel_log [--print-precise-timestamps]
+	#
+	# print whole dmesg
+	# try to transform default dmesg's seconds_from_boot timestamp to the more human-readable form
+
+	# args
+	local -r parameter="$1"
+
+	# consts
+	local -r dmesg_RE='^\[\ *([0-9]+)\.([0-9]{6})\]\ (.*)'
+	#                    [   47.973210] fpga mem virtual address is 0xd2000000
+
+	# vars
+	local raw_line log_message millisecond_part='000000'
+	local -i now uptime timestamp seconds_from_start line_counter
+	local -i same_millisecond_FLAG=0
+
+	# code
+	if uptime="$( get_system_uptime_in_seconds )" && now="$( get_current_system_time_in_seconds )"; then
+		dmesg | while IFS= read -r -t 0.1 raw_line; do
+			if [[ "$raw_line" =~ $dmesg_RE ]]; then
+				seconds_from_start="${BASH_REMATCH[1]}"
+				if [[ "${BASH_REMATCH[2]}" == "$millisecond_part" ]]; then
+					same_millisecond_FLAG=1
+					(( line_counter++ ))
+				else
+					same_millisecond_FLAG=0
+					(( line_counter = 0 ))
+				fi
+				millisecond_part="${BASH_REMATCH[2]}"
+				log_message="${BASH_REMATCH[3]}"
+				(( timestamp = now - uptime + seconds_from_start ))
+
+				if [[ "$parameter" == '--print-precise-timestamps' ]]; then
+					if (( same_millisecond_FLAG )); then
+						printf '%(%F %T)T.%s#%03u %s\n' "$timestamp" "$millisecond_part" "$line_counter" "$log_message"
+					else
+						printf '%(%F %T)T.%s %s\n' "$timestamp" "$millisecond_part" "$log_message"
+					fi
+				else
+					printf '%(%F %T)T %s\n' "$timestamp" "$log_message"
+				fi
+
+			else
+				echo "$raw_line"
+			fi
+		done
+	else
+		dmesg
+	fi
+}
+
+function print_tune_log {
+	local -r tune_log_file_17='/tmp/tune_log.txt'
+	local -r tune_log_file_9='/tmp/auto-tune'
+	local this_tune_log_script
+
+	if [[ -s "$tune_log_file_17" ]]; then
+		cat "$tune_log_file_17"
+	elif [[ -s "$tune_log_file_9" ]]; then
+		cat "$tune_log_file_9"
+	else
+		for this_tune_log_script in '/www/pages/cgi-bin/get_auto_tune_log.cgi' '/www/pages/cgi-bin/get_tune_log.cgi'; do
+			if [[ -s "$this_tune_log_script" ]]; then
+				sh "$this_tune_log_script"
+			fi
+		done
+	fi
+}
+
+function tail_tune_log {
+	print_tune_log | tail_any_log -t "$lines_to_tail"
+}
+
+function tail_miner_status_log {
+	local -r miner_status_log_file='/nvdata/miner_status.log'
+	tail_any_log -t "$lines_to_tail" "$miner_status_log_file"
+}
+
+function tail_watchdog_log {
+	local -r watchdog_log_file='/config/watchdog.log'
+	tail_any_log -t "$lines_to_tail" "$watchdog_log_file"
+}
+
+function collate_all_logs {
+	{	# !!! duct tape, should refactor someday
+		print_kernel_log --print-precise-timestamps
+		print_tune_log
+		[[ -s /nvdata/miner_status.log ]]	&& tail -n "$lines_to_tail" /nvdata/miner_status.log
+		[[ -s /config/watchdog.log ]]		&& tail -n "$lines_to_tail" /config/watchdog.log
+	} |
+		tail_any_log -t "$lines_to_tail" -s -r '^[0-9]'
+}
+
+
+# consts
+
+declare -r -i lines_to_tail=300
+declare -r RIG_CONF_default='/hive-config/rig.conf'
+declare -r RIG_CONF="${RIG_CONF:-$RIG_CONF_default}" # for ASIC emulator: set to default only if RIG_CONF variable is empty
+declare -r WALLET_CONF='/hive-config/wallet.conf'
+
+
+# vars
+
+declare -i is_no_Flight_Sheet=0
+
+
+# sources
+
+# shellcheck disable=SC1091
+source /hive/bin/colors
+# shellcheck disable=SC1091
+source /hive/bin/asic-model
+
+
+# main
+
+if [[ ! -s "$RIG_CONF" ]]; then
+	echo_x warning "Config file $RIG_CONF empty or not found"
+	# don't have to exit -- we simply don't have a config atm
+	#exit 1
+else
+	# shellcheck disable=SC1090
+	source "$RIG_CONF"
+fi
+
+if [[ ! -s "$WALLET_CONF" ]]; then
+	echo_x warning "Wallet file $WALLET_CONF empty not found"
+else
+	# shellcheck disable=SC1090
+	source "$WALLET_CONF"
+fi
+
+if [[ -z "$MINER" ]]; then
+	# rig.conf not found or empty
+	echo_x warning "No miner set in $RIG_CONF, will use default ${CYAN-}asicminer${NOCOLOR-}"
+	is_no_Flight_Sheet=1
+elif [[ "$MINER" != 'asicminer' ]]; then
+	# default rig.conf (before applying an any Flight Sheet) contains claymore as a default miner
+	echo_x warning  'To start mining, you only have to apply a Flight Sheet'
+	message warning 'To start mining, you only have to apply a Flight Sheet' --silent
+	is_no_Flight_Sheet=1
+fi
+
+case "$1" in
+	'config')
+		case "$2" in
+			'raw')			print_config_raw					;;
+			*)				print_config						;;
+		esac
+	;;
+
+	'config-gen')
+		generate_config
+	;;
+
+	'kernel-log')		# deprecated
+		print_kernel_log
+	;;
+
+	'log')
+		case "$2" in
+			'all')			collate_all_logs					;;
+			'kernel')		print_kernel_log					;;
+			'status')		tail_miner_status_log				;;
+			'tuning')		tail_tune_log						;;
+			'watchdog')		tail_watchdog_log					;;
+			'file')			# !!! duct tape
+							# probably improve it by adding --file option for any of miner logs?
+							# ...or carry over all the log handling to the brand new stand-alone log facility (it's better from the architectural point of view)
+							print_default_log > /tmp/kernel.log
+							message file /tmp/kernel.log --silent
+							rm /tmp/kernel.log					;;
+			*)				print_default_log					;;
+		esac
+	;;
+
+	'restart')
+		miner_restart
+	;;
+
+	'start')
+		miner_start 'by_user'
+	;;
+
+	'stop')
+		miner_stop 'by_user'
+	;;
+
+	'tuning')
+		# deprecated. please use more consistent 'miner log tuning'
+		tail_tune_log
+	;;
+
+	'')
+		print_script_version
+		screen -x -S bmminer > /dev/null ||
+			screen -x -S cgminer > /dev/null ||
+				echo_x info 'No miner screen running'
+	;;
+
+	'-h'|'--help'|*)
+		print_script_version
+		script_usage
+	;;
+esac

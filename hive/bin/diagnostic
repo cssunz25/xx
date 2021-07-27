@@ -1,0 +1,151 @@
+#!/hive/sbin/bash
+
+
+#
+# Copyright (C) 2016-2020  Hiveon
+# Distributed under GNU GENERAL PUBLIC LICENSE 2.0
+# License information can be found in the LICENSE file or at https://github.com/minershive/hiveos-asic/blob/master/LICENSE.txt
+#
+
+
+readonly script_mission='Client for ASICs: Diagnostic'
+readonly script_version='0.0.5'
+readonly script_basename="${0##*/}"
+
+
+function print_with_identation {
+	#
+	# Usage: cat file | print_with_identation
+	#
+
+	# vars
+	local line
+
+	# code
+	while read -r line || [[ -n "$line" ]]; do
+		echo "  $line"
+	done
+}
+
+function rematch {
+	# actually we don't have to use pure bash eh?
+	# rematch 'regex' ['string']
+
+	# args
+	local -r regex="$1"
+	local -r string="${2:-$( </dev/fd/0 )}" # get from arg or stdin
+
+	# code
+	[[ "$string" =~ $regex ]]
+	printf '%s\n' "${BASH_REMATCH[@]:1}"
+}
+
+function ping_conntrack_check {
+	# args
+	local -r address_to_check="$1"
+
+	# consts
+	local -r -i attempts_limit=10
+
+	# vars
+	local -i this_attempt passed_count=0
+
+	# code
+	for (( this_attempt = 1; this_attempt <= attempts_limit; this_attempt++ )); do
+#		echo $i
+		ping -c 1 -W 1 "$address_to_check" > /dev/null && (( passed_count++ ))
+	done
+
+	if (( passed_count == attempts_limit )); then
+		echo '[ OK ]'
+	else
+		echo "[ FAIL ] $passed_count/$attempts_limit"
+	fi
+}
+
+
+# main
+
+[[ -s /hive/bin/asic-model ]] && source /hive/bin/asic-model
+[[ -s /hive-config/rig.conf ]] && source /hive-config/rig.conf
+
+
+
+# HW: +date, +model, fw, +agent-version
+echo '---HW---'
+[[ -s /hive/etc/VERSION ]] && agent_release_version="$( < /hive/etc/VERSION )"
+[[ -s /hive/etc/build ]] && agent_build_version="$( < /hive/etc/build )"
+agent_full_version="${agent_release_version:-[unknown]}-${agent_build_version:-release}"
+echo "Date: $( date )"
+echo "Model: $ASIC_MODEL ($ASIC_MANUFACTURER)"
+echo "Client version: $agent_full_version"
+
+
+
+# LAN: +ip, +gw, +dns, +route, +mac, +ping gw, +ping dns, +arp
+ip="$(					LANG=C ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1 }' )"
+route="$(				LANG=C route -n | grep -v 'routing table' | print_with_identation )"
+gateway="$(				rematch '[0-9\.]+[ \t]+([0-9\.]+).+UG' <<< $route )"
+nameserver="$(			rematch 'nameserver[ \t]+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)' < /etc/resolv.conf )" # first nameserver
+mac="$(					LANG=C ifconfig eth0 | rematch 'HWaddr (.{17})' )"
+arp_check="$(			print_with_identation < /proc/net/arp )"
+ping_gw="$(				ping -c 5 -q "$gateway" | grep -v -e '---' -e '^$' | print_with_identation )"
+ping_gw_count="$(		ping_conntrack_check "$gateway" )"
+
+if [[ "$gateway" == "$nameserver" ]]; then
+	is_gateway_and_dns_equal_FLAG=1
+else
+	is_gateway_and_dns_equal_FLAG=0
+	ping_dns="$(		ping -c 5 -q "$nameserver" | grep -v -e '---' -e '^$' | print_with_identation )"
+	ping_dns_count="$(	ping_conntrack_check "$nameserver" )"
+fi
+
+echo -e "\n---LAN---"
+echo "IP: $ip   Gateway: $gateway   Nameserver: $nameserver   MAC: $mac"
+echo
+echo -e "Ping GW:\n$ping_gw"
+echo
+echo -e "Ping GW 10 attempts (conntrack check): $ping_gw_count"
+echo
+if (( is_gateway_and_dns_equal_FLAG )); then
+	echo -e "Ping DNS skipped: gateway = dns"
+else
+	echo -e "Ping DNS:\n$ping_dns"
+	echo
+	echo -e "Ping DNS 10 attempts (conntrack check):\n$ping_dns_count"
+fi
+echo
+echo -e "Routing table:\n$route"
+echo
+echo -e "ARP cache:\n$arp_check"
+echo
+echo '/etc/resolv.conf:'
+print_with_identation < /etc/resolv.conf
+
+
+
+# INET: +ping inet DNS, +location and realip
+echo -e "\n---INET---"
+# ping inet DNS
+ping_dns_1="$( ping -c 3 -q 8.8.8.8 | grep -v -e '---' -e '^$' | print_with_identation )"
+ping_dns_2="$( ping -c 3 -q 1.1.1.1 | grep -v -e '---' -e '^$' | print_with_identation )"
+# location and realip
+location="$( curl -s 2ip.ua | print_with_identation )"
+
+echo -e "Ping Inet DNS 1:\n$ping_dns_1"
+echo
+echo -e "Ping Inet DNS 2:\n$ping_dns_2"
+echo
+echo -e "Location:\n$location"
+echo
+
+
+# SERVER: hive-api, resolve ip, ping, time curl, other servers
+echo -e "\n---API---"
+
+# FARM: farm_id, rig_id, rig.conf file date, wallet file date
+echo -e "\n---FARM---"
+
+
+
+

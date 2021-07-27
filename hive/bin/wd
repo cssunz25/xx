@@ -1,0 +1,290 @@
+#!/hive/sbin/bash
+
+
+#
+# Copyright (C) 2017  Hiveon Holding LTD
+# Distributed under Business Source License 1.1
+# License information can be found in the LICENSE.txt file or at https://github.com/minershive/hiveos-asic/blob/master/LICENSE.txt
+#
+
+
+readonly script_mission='Client for ASICs: Hashrate Watchdog'
+readonly script_version='0.3.4'
+readonly script_basename="${0##*/}"
+#
+readonly script_DEBUG="${script_DEBUG:-0}" # use value from env if exists
+
+
+# functions
+
+function assert_wd_parameters {
+	#
+	# exhaustively check and sanitize WD_ENABLED, WD_MINER and WD_REBOOT vars -- better safe than sorry
+	#
+
+	# code
+	if [[ ! -v WD_ENABLED ]]; then
+		log_line error 'Hashrate Watchdog disabled: WD_ENABLED variable is absent'
+		(( WD_ENABLED = 0 ))
+	elif [[ -z "$WD_ENABLED" ]]; then
+		log_line error 'Hashrate Watchdog disabled: WD_ENABLED variable is empty'
+		(( WD_ENABLED = 0 ))
+	elif (( WD_ENABLED == 0 )); then
+		log_line warning 'Hashrate Watchdog disabled'
+	elif (( WD_ENABLED == 1 )); then
+		log_line ok 'Hashrate Watchdog enabled'
+	else
+		log_line error "Hashrate Watchdog disabled: WD_ENABLED variable magically set to '$WD_ENABLED'"
+		(( WD_ENABLED = 0 ))
+	fi
+
+	if (( ! WD_ENABLED )); then
+		log_line warning 'Nothing to bark at, exiting'
+		exit 0
+	fi
+
+	if [[ ! -v WD_MINER && ! -v WD_REBOOT ]]; then
+		message warning 'Restart and reboot timers are absent. Hashrate Watchdog disabled. Please configure properly' --silent --payload < "$RIG_CONF"
+		log_line error 'WD_MINER and WD_REBOOT timers are absent. Hashrate Watchdog disabled, exiting'
+		exit 1
+	fi
+
+	if [[ -z "$WD_MINER" && -z "$WD_REBOOT" ]]; then
+		message warning 'Restart and reboot timers are empty. Hashrate Watchdog disabled. Please configure properly' --silent --payload < "$RIG_CONF"
+		log_line error 'WD_MINER and WD_REBOOT timers are empty. Hashrate Watchdog disabled, exiting'
+		exit 1
+	fi
+
+	# forcibly set to 0 if vars aren't set or are empty
+	: "${WD_REBOOT:=0}"
+	: "${WD_MINER:=0}"
+
+	if (( ( ! WD_MINER ) && ( ! WD_REBOOT ) )); then
+		message warning 'Restart and reboot timers both set to 0 (zero) minutes. Hashrate Watchdog disabled. Please configure properly' --silent --payload < "$RIG_CONF"
+		log_line error 'WD_MINER and WD_REBOOT timers both set to 0 (zero) minutes. Hashrate Watchdog disabled, exiting'
+		exit 1
+	fi
+}
+
+function load_configuration {
+	# vars
+	local -i current_RIG_CONF_date
+
+	# code
+	if [[ -s "$RIG_CONF" ]]; then
+		current_RIG_CONF_date="$( get_file_last_modified_time_in_seconds "$RIG_CONF" )"
+		if (( last_RIG_CONF_date != current_RIG_CONF_date )); then
+			if (( last_RIG_CONF_date == 0 )); then
+				log_line info "Loading & processing $RIG_CONF..."
+			else
+				log_line info "$RIG_CONF have been changed since the last check. Reloading & processing..."
+			fi
+
+			(( last_RIG_CONF_date = current_RIG_CONF_date )) # update a date
+
+			source "$RIG_CONF"
+			assert_wd_parameters
+
+			minhash="$( jq --raw-output ".\"$MINER\"" <<< "$WD_MINHASHES" )"
+			if is_JSON_string_empty_or_null "$minhash"; then
+				message warning "Minimal hashrate for $MINER is not set. You have to configure Hashrate Watchdog" --silent
+				log_line error "Minimal hashrate for $MINER is not set in config, exiting"
+				exit 1
+			fi
+			log_line info "Miner restart in ${WHITE}$WD_MINER${NOCOLOR}m and worker reboot in ${WHITE}$WD_REBOOT${NOCOLOR}m if hashrate < ${WHITE}$( khs_to_human_friendly_hashrate "$minhash" )${NOCOLOR}"
+		else
+			(( script_DEBUG )) && log_line debug "Config file $RIG_CONF have not changed since last check. Skipping..."
+		fi
+	else
+		log_line error "Config file $RIG_CONF not found or empty, exiting"
+		exit 1
+	fi
+}
+
+function set_lastgood {
+	if [[ -f "$khs_FILE" ]]; then
+		lastgood_khs="$( get_file_last_modified_time_in_seconds "$khs_FILE" )"
+	else
+		lastgood_khs="$( get_current_system_time_in_seconds )" # let's count from now on
+	fi
+
+	miner_restart_count=0
+}
+
+function get_max_of_three_numbers {
+	# args
+	local -r -i num1="$1"
+	local -r -i num2="$2"
+	local -r -i num3="$3"
+
+	# code
+	if (( num1 > num2 && num1 > num3 )); then
+		echo "$num1"
+	elif (( num2 > num1 && num2 > num3 )); then
+		echo "$num2"
+	else
+		echo "$num3"
+	fi
+}
+
+function kick_the_dog {
+	# consts
+	local -r -i seconds_in_24h=$(( 60 * 60 * 24 ))
+
+	# vars
+	local -i khs_integer minhash_integer elapsed_safe_limit
+	local khs
+
+	# code
+	load_configuration
+
+	[[ -s "$khs_FILE" ]] && khs="$( < "$khs_FILE" )"
+	: "${khs:=0}" # set to 0 if empty or not defined
+
+	khs_integer="$( scientific_to_integer "$khs" )"
+	minhash_integer="$( scientific_to_integer "$minhash" )"
+
+	if (( khs_integer >= minhash_integer )); then
+		set_lastgood
+		if (( ok_count == 0 )); then
+			log_line ok "$MINER hashrate OK (${WHITE}$( khs_to_human_friendly_hashrate "$khs" )${NOCOLOR} ${GREEN}>=${NOCOLOR} ${WHITE}$( khs_to_human_friendly_hashrate "$minhash" )${NOCOLOR})"
+		fi
+		(( ok_count++ ))
+		(( ok_count >= OK_MESSAGE_REDUCE )) && ok_count=0
+		return
+	fi
+
+	now="$( get_current_system_time_in_seconds )"
+	(( elapsed = now - lastgood_khs ))
+	elapsed_safe_limit="$( get_max_of_three_numbers $(( WD_REBOOT * 60 )) $(( WD_MINER * 60 )) $(( seconds_in_24h )) )"
+
+	if (( elapsed > elapsed_safe_limit || elapsed < 0 )); then
+		# most likely the system date was changed
+		# !!! the watchdog limit is 24h or WD_REBOOT or WD_MINER (which is greater)
+		log_line warning '!'
+		log_line warning '! GRR-GRR! Something wrong with the system time?'
+		log_line warning "! The last valid result was received a ${WHITE}$( seconds2dhms "$elapsed" )${NOCOLOR} ago"
+		log_line warning '! Watchdog reset to a current time'
+		log_line warning '!'
+		# let's give another chance: update lastgood to a current datetime
+		set_lastgood
+		return
+	fi
+#
+# checking for a flag file that does indicate that mining is stopped due to some manufacturing defects
+# !!! postponed until the bug in hiveon miner will go away (sometimes it does a mining even if /config/stop-mining file exists
+#
+#	if [[ -s /config/stop-mining ]]; then
+#		log_line warning "Safe mode for $MINER activated, watchdog paused and isn't active for ${WHITE}$( seconds2dhms "$elapsed" )${NOCOLOR}"
+#		return
+#	fi
+
+	log_line warning "BARK-BARK! $MINER hashrate ${WHITE}$( khs_to_human_friendly_hashrate "$khs" ) ${YELLOW}<${NOCOLOR} ${WHITE}$( khs_to_human_friendly_hashrate "$minhash" )${NOCOLOR} for ${WHITE}$( seconds2dhms "$elapsed" )${NOCOLOR}"
+
+	# check for reboot condition first
+	if (( WD_REBOOT )); then
+		(( reboot_timeout = WD_REBOOT * 60 ))
+		if (( elapsed >= reboot_timeout )); then
+			message danger "Hashrate Watchdog: low hashrate ($( khs_to_human_friendly_hashrate "$khs" )) for $( seconds2dhms "$elapsed" ), rebooting" --silent
+			log_line error '!'
+			log_line error "! Rebooting after $WD_REBOOT minutes of continuous barking"
+			log_line error '!'
+			#sreboot
+			nohup bash -c 'reboot' > /tmp/nohup.log 2>&1 & disown
+			return # for testing and in case it does not work
+		fi
+	fi
+
+	# check for restart miner condition
+	if (( WD_MINER )); then
+		(( miner_restart_timeout = WD_MINER * 60 ))
+		if (( miner_restart_count == 0 && elapsed >= miner_restart_timeout )); then
+			message warning "Hashrate Watchdog: low hashrate ($( khs_to_human_friendly_hashrate "$khs" )) for $( seconds2dhms "$elapsed" ), restarting" --silent
+			log_line warning '!'
+			log_line warning "! Restarting $MINER after $WD_MINER minutes of continuous barking"
+			log_line warning '!'
+			miner_restart_count=1
+			/hive/bin/miner restart
+		fi
+	fi
+}
+
+
+# consts
+
+declare -r sleep_time=20 # seconds to sleep over iteration
+declare -r OK_MESSAGE_REDUCE=$(( 1 * 60 / sleep_time )) # e.g. only every 12th message will be displayed to reduce log
+declare -r RIG_CONF='/hive-config/rig.conf'
+declare -r khs_FILE='/run/hive/khs'
+#declare -r arr_FILE='/run/hive/arr' # accepted/rejected ratio file, reserved for future development
+
+
+# vars
+
+declare -i ok_count=0 miner_restart_count lastgood_khs last_RIG_CONF_date
+declare minhash
+
+
+# sources
+
+[[ -t 1 ]] && source /hive/bin/colors
+source /hive/bin/hive-functions.sh || { echo 'ERROR: /hive/bin/hive-functions.sh not found'; exit 1; }
+
+
+# main
+
+set_lastgood
+
+case "$1" in
+	'run'|'start')
+		log_line info "$script_mission, version $script_version started"
+
+		load_configuration
+
+		while true; do
+			kick_the_dog
+			snore "$sleep_time"
+		done
+	;;
+
+	'stop')
+		# TODO get rid of 'stop' made out of shit and sticks -- refactor to stop on SIGUSR1 or SIGSTOP
+		printf -v marker '%(%s)T-%s-%u%u' -1 "${FUNCNAME[0]}" "${RANDOM}" "${RANDOM}"
+		self="(${$}|${BASHPID})[[:space:]].+$0"
+		if ps w | grep -F -e "$0" -e "$marker" | grep -Ev -e "$marker" -e "$self" | awk '{print $1}' | xargs kill > /dev/null 2>&1; then
+			log_line warning "$script_mission, version $script_version stopped"
+		else
+			log_line error "$script_mission, version $script_version was not running"
+		fi
+	;;
+
+#	'start')
+#		/hive/bin/wd run
+#	;;
+
+	'restart')
+		/hive/bin/wd stop
+		/hive/bin/wd run
+	;;
+
+	'log')
+		print_script_version
+		echo "TODO"
+	;;
+
+	'status')
+		print_script_version
+		self_count="$( pgrep_count "$0" )"
+		if (( self_count )); then
+			echo 'Watchdog is running'
+		else
+			echo 'Watchdog is not running'
+		fi
+	;;
+
+	*)
+		print_script_version
+		echo -e "Usage: ${CYAN}$script_basename start|stop|restart|log|status${NOCOLOR}"
+		echo
+	;;
+esac

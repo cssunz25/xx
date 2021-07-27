@@ -1,0 +1,123 @@
+#!/hive/sbin/bash
+#
+# The Bash shell script executes a command with a time-out.
+# Upon time-out expiration SIGTERM (15) is sent to the process. If the signal
+# is blocked, then the subsequent SIGKILL (9) terminates it.
+#
+# Based on the Bash documentation example.
+
+# Hello Chet,
+# please find attached a "little easier"  :-)  to comprehend
+# time-out example.  If you find it suitable, feel free to include
+# anywhere: the very same logic as in the original examples/scripts, a
+# little more transparent implementation to my taste.
+#
+# Dmitry V Golovashkin <Dmitry.Golovashkin@sas.com>
+
+scriptName="${0##*/}"
+
+declare -i DEFAULT_TIMEOUT=9
+declare -i DEFAULT_INTERVAL=1
+declare -i DEFAULT_DELAY=1
+
+# Timeout.
+declare -i timeout=DEFAULT_TIMEOUT
+# Interval between checks if the process is still alive.
+declare -i interval=DEFAULT_INTERVAL
+# Delay between posting the SIGTERM signal and destroying the process by SIGKILL.
+declare -i delay=DEFAULT_DELAY
+
+function printUsage() {
+    cat <<EOF
+
+Synopsis
+    $scriptName [-t timeout] [-i interval] [-d delay] command
+    Execute a command with a time-out.
+    Upon time-out expiration SIGTERM (15) is sent to the process. If SIGTERM
+    signal is blocked, then the subsequent SIGKILL (9) terminates it.
+
+    -t timeout
+        Number of seconds to wait for command completion.
+        Default value: $DEFAULT_TIMEOUT seconds.
+
+    -i interval
+        Interval between checks if the process is still alive.
+        Positive integer, default value: $DEFAULT_INTERVAL seconds.
+
+    -d delay
+        Delay between posting the SIGTERM signal and destroying the
+        process by SIGKILL. Default value: $DEFAULT_DELAY seconds.
+
+As of today, Bash does not support floating point arithmetic (sleep does),
+therefore all delay/time values must be integers.
+EOF
+}
+
+function snore {
+	#
+	# Usage: snore 1
+	#        snore 0.2
+	#
+	# pure bash 'sleep'
+	# https://blog.dhampir.no/content/sleeping-without-a-subprocess-in-bash-and-how-to-sleep-forever
+
+	# args
+	local -r __sleep_time="${1-1}" # 1s by default
+
+	# vars
+	local IFS # reset IFS in case it's set to something weird
+
+	# code
+	# shellcheck disable=SC1083
+	# because 'man bash':
+	# Each redirection that may be preceded by a file descriptor number may instead be preceded by a word of the form {varname}.
+	[[ -n "${__snore_fd:-}" ]] || { exec {__snore_fd}<> <(:); } 2> /dev/null ||
+	{
+		# workaround for MacOS and similar systems
+		local fifo
+		fifo="$( mktemp -u )"
+		mkfifo -m 700 "$fifo"
+		# shellcheck disable=SC2093
+		exec {__snore_fd}<>"$fifo"
+		rm "$fifo"
+	}
+	read -t "${__sleep_time}" -u "$__snore_fd" || :
+}
+
+# Options.
+while getopts ":t:i:d:" option; do
+    case "$option" in
+        t) timeout=$OPTARG ;;
+        i) interval=$OPTARG ;;
+        d) delay=$OPTARG ;;
+        *) printUsage; exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+# $# should be at least 1 (the command to execute), however it may be strictly
+# greater than 1 if the command itself has options.
+if (($# == 0 || interval <= 0)); then
+    printUsage
+    exit 1
+fi
+
+# : |           Close stdin for the subshell
+# kill -0 pid   Exit code indicates if a signal may be sent to $pid process.
+: | (
+    ((t = timeout))
+
+    while ((t > 0)); do
+        snore "$interval"
+        kill -0 $$ || exit 0
+        ((t -= interval))
+    done
+
+    # Be nice, post SIGTERM first.
+    # The 'exit 0' below will be executed if any preceeding command fails.
+    kill -s SIGTERM $$ && kill -0 $$ || exit 0
+    snore "$delay"
+    kill -s SIGKILL $$
+) &> /dev/null & disown
+
+exec "$@"
